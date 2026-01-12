@@ -87,14 +87,23 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(job_input, dict):
         raise ValueError("job['input'] must be an object")
 
-    # Basic required fields (let Kokoro perform full validation).
-    if not job_input.get("input"):
-        raise ValueError("Missing required field: input")
+    # Accept both OpenAI-compatible `input` and a more intuitive alias `text`.
+    # Many UIs (including RunPod console examples) use `text`.
+    text = job_input.get("input") or job_input.get("text")
+    if not text:
+        raise ValueError("Missing required field: input (or 'text' alias)")
     if not job_input.get("voice"):
         raise ValueError("Missing required field: voice")
 
     _ensure_kokoro_ready()
-    audio_bytes, mime_type = _call_kokoro_openai_speech(job_input)
+    kokoro_payload = dict(job_input)
+    kokoro_payload["input"] = text
+    # `text` is not part of the OpenAI-compatible schema; drop it to avoid confusion.
+    kokoro_payload.pop("text", None)
+    # Default model if omitted
+    kokoro_payload.setdefault("model", "kokoro")
+
+    audio_bytes, mime_type = _call_kokoro_openai_speech(kokoro_payload)
 
     response_format = job_input.get("response_format", "mp3")
     return {
