@@ -2,10 +2,19 @@ import base64
 import os
 import subprocess
 import time
+import threading
+import sys
 from typing import Any, Dict, Optional, Tuple
 
 import requests
 import runpod
+
+# Minimal imports to check environment if possible, otherwise we rely on subprocess/logs
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 
 KOKORO_BASE_URL = os.environ.get("KOKORO_BASE_URL", "http://127.0.0.1:8880").rstrip("/")
@@ -13,6 +22,55 @@ KOKORO_HEALTH_URL = f"{KOKORO_BASE_URL}/health"
 KOKORO_SPEECH_URL = f"{KOKORO_BASE_URL}/v1/audio/speech"
 
 _kokoro_proc: Optional[subprocess.Popen] = None
+
+
+def log(msg: str):
+    """Simple logging helper to ensure flush."""
+    print(f"[RunPodWorker] {msg}", flush=True)
+
+
+def _print_system_diagnostics():
+    log("--- System Diagnostics ---")
+    
+    # 1. Check NVIDIA-SMI
+    try:
+        log("Running nvidia-smi...")
+        smi = subprocess.check_output(["nvidia-smi"], encoding="utf-8")
+        print(smi, flush=True)
+    except Exception as e:
+        log(f"Error running nvidia-smi: {e}")
+
+    # 2. Check PyTorch CUDA
+    if TORCH_AVAILABLE:
+        try:
+            log(f"Torch version: {torch.__version__}")
+            cuda_available = torch.cuda.is_available()
+            log(f"Torch CUDA Available: {cuda_available}")
+            if cuda_available:
+                log(f"CUDA Device Count: {torch.cuda.device_count()}")
+                log(f"Current Device Name: {torch.cuda.get_device_name(0)}")
+            else:
+                log("WARNING: Torch detects NO CUDA devices.")
+        except Exception as e:
+            log(f"Error checking torch: {e}")
+    else:
+        log("Torch not imported in handler script (might be in venv).")
+
+    # 3. Check logs environment
+    log(f"Environment LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH', 'Not Set')}")
+    log("-------------------------")
+
+
+def _stream_logs(process: subprocess.Popen):
+    """Reads stdout from the child process and logs it."""
+    if process.stdout is None:
+        return
+    
+    # Iterate lines
+    for line in iter(process.stdout.readline, b""):
+        line_str = line.decode("utf-8", errors="replace").strip()
+        if line_str:
+            print(f"[KokoroServer] {line_str}", flush=True)
 
 
 def _is_kokoro_up(timeout_s: float = 1.0) -> bool:
@@ -26,23 +84,33 @@ def _is_kokoro_up(timeout_s: float = 1.0) -> bool:
 def _start_kokoro_server() -> None:
     """
     Starts Kokoro-FastAPI inside the container.
-
-    We assume the container image already contains Kokoro-FastAPI and an `entrypoint.sh`
-    that launches uvicorn on port 8880 (this is true for the official images).
     """
     global _kokoro_proc
     if _kokoro_proc is not None and _kokoro_proc.poll() is None:
         return
 
-    # Best-effort: if the base image provides /app/entrypoint.sh, run it.
-    # It will block, so we run it as a subprocess.
-    _kokoro_proc = subprocess.Popen(
-        ["./entrypoint.sh"],
-        cwd="/app",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=os.environ.copy(),
-    )
+    _print_system_diagnostics()
+
+    log("Starting internal Kokoro-FastAPI server...")
+    
+    # We use unbuffered output via -u if python is involved, but entrypoint.sh handles it.
+    # We allow stdout to be piped so we can capture it in a thread.
+    try:
+        _kokoro_proc = subprocess.Popen(
+            ["./entrypoint.sh"],
+            cwd="/app",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Merge stderr into stdout
+            env=os.environ.copy(),
+        )
+        
+        # Start a background thread to print logs from the server to RunPod logs
+        t = threading.Thread(target=_stream_logs, args=(_kokoro_proc,), daemon=True)
+        t.start()
+        
+    except Exception as e:
+        log(f"Failed to start subprocess: {e}")
+        raise e
 
 
 def _ensure_kokoro_ready(wait_timeout_s: float = 120.0) -> None:
@@ -51,14 +119,21 @@ def _ensure_kokoro_ready(wait_timeout_s: float = 120.0) -> None:
 
     _start_kokoro_server()
 
+    log("Waiting for Kokoro server to be healthy...")
     start = time.time()
     while time.time() - start < wait_timeout_s:
-        if _kokoro_proc is not None and _kokoro_proc.poll() is not None:
-            raise RuntimeError("Kokoro server process exited during startup")
+        if _kokoro_proc is not None:
+            ret = _kokoro_proc.poll()
+            if ret is not None:
+                log(f"CRITICAL: Kokoro server process exited unexpectedly with code {ret}")
+                raise RuntimeError("Kokoro server process exited during startup")
+        
         if _is_kokoro_up(timeout_s=1.0):
+            log("Kokoro server is ready!")
             return
-        time.sleep(0.5)
+        time.sleep(1.0)
 
+    log("Timed out waiting for Kokoro server.")
     raise TimeoutError("Timed out waiting for Kokoro server to become ready")
 
 
@@ -67,20 +142,25 @@ def _call_kokoro_openai_speech(payload: Dict[str, Any]) -> Tuple[bytes, str]:
     payload = dict(payload)
     payload["stream"] = False
 
+    t0 = time.time()
     r = requests.post(KOKORO_SPEECH_URL, json=payload, timeout=300)
+    dur = time.time() - t0
+    
     if r.status_code != 200:
+        log(f"Kokoro API Error ({r.status_code}): {r.text}")
         raise ValueError(f"Kokoro error {r.status_code}: {r.text}")
+    
     mime = r.headers.get("content-type", "application/octet-stream")
+    log(f"Generated audio in {dur:.2f}s | Size: {len(r.content)} bytes | Mime: {mime}")
     return r.content, mime
 
 
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     RunPod queue-based handler.
-
-    Input: job['input'] should look like Kokoro-FastAPI's OpenAI-compatible /v1/audio/speech JSON.
-    Output: base64 audio + mime type in JSON.
     """
+    log(f"Received jobID: {job.get('id')}")
+    
     if not isinstance(job, dict):
         raise ValueError("job must be a dict")
     job_input = job.get("input")
@@ -88,21 +168,20 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("job['input'] must be an object")
 
     # Accept both OpenAI-compatible `input` and a more intuitive alias `text`.
-    # Many UIs (including RunPod console examples) use `text`.
     text = job_input.get("input") or job_input.get("text")
     if not text:
         raise ValueError("Missing required field: input (or 'text' alias)")
-    if not job_input.get("voice"):
-        raise ValueError("Missing required field: voice")
-
+    
+    # Ensure background server is running
     _ensure_kokoro_ready()
+
+    # Prepare payload
     kokoro_payload = dict(job_input)
     kokoro_payload["input"] = text
-    # `text` is not part of the OpenAI-compatible schema; drop it to avoid confusion.
     kokoro_payload.pop("text", None)
-    # Default model if omitted
     kokoro_payload.setdefault("model", "kokoro")
 
+    # Call internal API
     audio_bytes, mime_type = _call_kokoro_openai_speech(kokoro_payload)
 
     response_format = job_input.get("response_format", "mp3")
@@ -116,4 +195,3 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
-
