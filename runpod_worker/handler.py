@@ -58,6 +58,9 @@ def _print_system_diagnostics():
 
     # 3. Check logs environment
     log(f"Environment LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH', 'Not Set')}")
+    log(f"Environment NVIDIA_VISIBLE_DEVICES: {os.environ.get('NVIDIA_VISIBLE_DEVICES', 'Not Set')}")
+    log(f"Environment USE_GPU: {os.environ.get('USE_GPU', 'Not Set')}")
+    log(f"Environment DEVICE_TYPE: {os.environ.get('DEVICE_TYPE', 'Not Set')}")
     log("-------------------------")
 
 
@@ -137,13 +140,17 @@ def _ensure_kokoro_ready(wait_timeout_s: float = 120.0) -> None:
     raise TimeoutError("Timed out waiting for Kokoro server to become ready")
 
 
+# Global session for connection pooling
+_session = requests.Session()
+
+
 def _call_kokoro_openai_speech(payload: Dict[str, Any]) -> Tuple[bytes, str]:
     # Force non-streaming for queue-based mode.
     payload = dict(payload)
     payload["stream"] = False
 
     t0 = time.time()
-    r = requests.post(KOKORO_SPEECH_URL, json=payload, timeout=300)
+    r = _session.post(KOKORO_SPEECH_URL, json=payload, timeout=300)
     dur = time.time() - t0
     
     if r.status_code != 200:
@@ -192,6 +199,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         "sample_rate": 24000,
     }
 
+
+# Ensure background server is running during provision
+_ensure_kokoro_ready()
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})

@@ -2,9 +2,16 @@ FROM ghcr.io/remsky/kokoro-fastapi-gpu:latest
 
 WORKDIR /app
 
+# Ensure NVIDIA runtime correctly exposes the GPU
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV USE_GPU=true
+ENV DEVICE_TYPE=cuda
+
 RUN uv pip install --no-cache runpod requests
 
 COPY runpod_worker ./runpod_worker
 
 CMD ["python", "-u", "runpod_worker/handler.py"]
+
 
