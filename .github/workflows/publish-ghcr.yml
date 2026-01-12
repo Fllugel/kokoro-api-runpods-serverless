@@ -12,6 +12,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  # GHCR repository names must be lowercase. We'll compute a lowercase variant at runtime.
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
@@ -41,6 +42,10 @@ jobs:
           sudo rm -rf /usr/share/dotnet || true
           docker system prune -af || true
 
+      - name: Lowercase image name for GHCR
+        run: |
+          echo "IMAGE_NAME_LC=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -61,6 +66,6 @@ jobs:
           file: ${{ matrix.dockerfile }}
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ matrix.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ github.sha }}-${{ matrix.tag }}
 
