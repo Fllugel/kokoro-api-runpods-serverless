@@ -1,5 +1,8 @@
 FROM ghcr.io/remsky/kokoro-fastapi-gpu:latest
 
+# Reset entrypoint to avoid conflicts with base image
+ENTRYPOINT []
+
 WORKDIR /app
 
 # Ensure NVIDIA runtime correctly exposes the GPU
@@ -8,10 +11,16 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ENV USE_GPU=true
 ENV DEVICE_TYPE=cuda
 
-RUN uv pip install --no-cache runpod requests
+# Persistent storage for models (Prevents re-downloading on every start if volume is attached)
+ENV HF_HOME=/runpod-volume
+ENV TRANSFORMERS_CACHE=/runpod-volume
+ENV HF_HUB_CACHE=/runpod-volume
+ENV PYTHONPATH=/app:/app/api
+
+# Install dependencies using uv for speed, with a fallback for system packages
+RUN uv pip install --no-cache runpod requests || pip install --no-cache runpod requests --break-system-packages
 
 COPY runpod_worker ./runpod_worker
 
+# Run the handler with unbuffered output
 CMD ["python", "-u", "runpod_worker/handler.py"]
-
-

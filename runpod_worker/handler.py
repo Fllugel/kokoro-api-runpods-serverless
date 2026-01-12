@@ -86,7 +86,7 @@ def _is_kokoro_up(timeout_s: float = 1.0) -> bool:
 
 def _start_kokoro_server() -> None:
     """
-    Starts Kokoro-FastAPI inside the container.
+    Starts Kokoro-FastAPI inside the container with fallback methods.
     """
     global _kokoro_proc
     if _kokoro_proc is not None and _kokoro_proc.poll() is None:
@@ -94,49 +94,69 @@ def _start_kokoro_server() -> None:
 
     _print_system_diagnostics()
 
+    # Enforce GPU usage in the environment
+    os.environ["USE_GPU"] = "true"
+    os.environ["DEVICE_TYPE"] = "cuda"
+    os.environ["PYTHONPATH"] = "/app:/app/api"
+
     log("Starting internal Kokoro-FastAPI server...")
     
-    # We use unbuffered output via -u if python is involved, but entrypoint.sh handles it.
-    # We allow stdout to be piped so we can capture it in a thread.
+    # Try entrypoint script first
     try:
+        if os.path.exists("/app/entrypoint.sh"):
+            log("Executing /app/entrypoint.sh...")
+            os.chmod("/app/entrypoint.sh", 0o755)
+            _kokoro_proc = subprocess.Popen(
+                ["/app/entrypoint.sh"],
+                cwd="/app",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=os.environ.copy(),
+            )
+        else:
+            raise FileNotFoundError("entrypoint.sh not found")
+            
+    except Exception as e:
+        log(f"Entrypoint failed or missing: {e}. Falling back to direct uvicorn...")
+        # Fallback: Run uvicorn directly using the same command as the other user's stable version
         _kokoro_proc = subprocess.Popen(
-            ["./entrypoint.sh"],
+            [sys.executable, "-m", "uvicorn", "api.src.main:app", "--host", "0.0.0.0", "--port", "8880"],
             cwd="/app",
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,  # Merge stderr into stdout
+            stderr=subprocess.STDOUT,
             env=os.environ.copy(),
         )
         
-        # Start a background thread to print logs from the server to RunPod logs
-        t = threading.Thread(target=_stream_logs, args=(_kokoro_proc,), daemon=True)
-        t.start()
-        
-    except Exception as e:
-        log(f"Failed to start subprocess: {e}")
-        raise e
+    # Start log streaming
+    t = threading.Thread(target=_stream_logs, args=(_kokoro_proc,), daemon=True)
+    t.start()
 
 
-def _ensure_kokoro_ready(wait_timeout_s: float = 120.0) -> None:
+def _ensure_kokoro_ready(wait_timeout_s: float = 300.0) -> None:
+    """Waits for the Kokoro server to be healthy, allowing time for model downloads."""
     if _is_kokoro_up():
         return
 
     _start_kokoro_server()
 
-    log("Waiting for Kokoro server to be healthy...")
+    log("Waiting for Kokoro server to be healthy (this may take a few minutes if seeds are being downloaded)...")
     start = time.time()
     while time.time() - start < wait_timeout_s:
         if _kokoro_proc is not None:
             ret = _kokoro_proc.poll()
             if ret is not None:
                 log(f"CRITICAL: Kokoro server process exited unexpectedly with code {ret}")
-                raise RuntimeError("Kokoro server process exited during startup")
+                # Log last few lines if possible
+                raise RuntimeError(f"Kokoro server process exited during startup with code {ret}")
         
-        if _is_kokoro_up(timeout_s=1.0):
+        if _is_kokoro_up(timeout_s=2.0):
             log("Kokoro server is ready!")
             return
-        time.sleep(1.0)
+        
+        # Sleep slightly longer to avoid spamming logs while waiting for massive downloads
+        time.sleep(2.0)
 
-    log("Timed out waiting for Kokoro server.")
+    log("Timed out waiting for Kokoro server to start.")
     raise TimeoutError("Timed out waiting for Kokoro server to become ready")
 
 
