@@ -1,0 +1,16 @@
+FROM ghcr.io/remsky/kokoro-fastapi-cpu:latest
+
+# We extend the official Kokoro-FastAPI image and add a queue-based RunPod handler
+# that calls the local Kokoro server over HTTP.
+
+WORKDIR /app
+
+# Install worker dependencies into the existing env provided by the base image.
+# The base image uses uv; `uv pip` is the most reliable way to add deps here.
+RUN uv pip install --no-cache runpod requests
+
+COPY runpod_worker ./runpod_worker
+
+# Run the RunPod worker (it starts Kokoro via /app/entrypoint.sh internally).
+CMD ["python", "-u", "runpod_worker/handler.py"]
+

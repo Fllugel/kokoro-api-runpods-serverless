@@ -1,0 +1,10 @@
+FROM ghcr.io/remsky/kokoro-fastapi-gpu:latest
+
+WORKDIR /app
+
+RUN uv pip install --no-cache runpod requests
+
+COPY runpod_worker ./runpod_worker
+
+CMD ["python", "-u", "runpod_worker/handler.py"]
+

@@ -1,0 +1,20 @@
+.DS_Store
+Thumbs.db
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.env
+.env.*
+
+# Local outputs
+output*.mp3
+output*.wav
+out*.mp3
+
