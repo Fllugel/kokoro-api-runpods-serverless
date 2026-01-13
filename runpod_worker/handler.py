@@ -184,38 +184,31 @@ def _call_kokoro_openai_speech(payload: Dict[str, Any]) -> Tuple[bytes, str]:
 
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     """
-    RunPod queue-based handler.
+    RunPod queue-based handler. Acts as a transparent proxy to the internal FastAPI.
     """
     log(f"Received jobID: {job.get('id')}")
     
-    if not isinstance(job, dict):
-        raise ValueError("job must be a dict")
-    job_input = job.get("input")
+    job_input = job.get("input", {})
     if not isinstance(job_input, dict):
         raise ValueError("job['input'] must be an object")
 
-    # Accept both OpenAI-compatible `input` and a more intuitive alias `text`.
-    text = job_input.get("input") or job_input.get("text")
-    if not text:
-        raise ValueError("Missing required field: input (or 'text' alias)")
-    
     # Ensure background server is running
     _ensure_kokoro_ready()
 
-    # Prepare payload
-    kokoro_payload = dict(job_input)
-    kokoro_payload["input"] = text
-    kokoro_payload.pop("text", None)
-    kokoro_payload.setdefault("model", "kokoro")
+    # Prepare payload: Map 'text' alias to 'input' if 'input' is missing
+    if "text" in job_input and "input" not in job_input:
+        job_input["input"] = job_input.pop("text")
+    
+    if "input" not in job_input:
+         raise ValueError("Missing required field: 'input' or 'text'")
 
-    # Call internal API
-    audio_bytes, mime_type = _call_kokoro_openai_speech(kokoro_payload)
+    # Call internal API with the raw payload
+    audio_bytes, mime_type = _call_kokoro_openai_speech(job_input)
 
-    response_format = job_input.get("response_format", "mp3")
     return {
         "audio_base64": base64.b64encode(audio_bytes).decode("utf-8"),
         "mime_type": mime_type,
-        "format": response_format,
+        "format": job_input.get("response_format", job_input.get("format", "mp3")),
         "sample_rate": 24000,
     }
 
